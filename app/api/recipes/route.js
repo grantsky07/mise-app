@@ -1,0 +1,114 @@
+import { NextResponse } from "next/server";
+
+export async function POST(request) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return NextResponse.json(
+      { error: "ANTHROPIC_API_KEY is not configured." },
+      { status: 500 }
+    );
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+  }
+
+  const { inventory, modes, preferences } = body;
+  if (!inventory) {
+    return NextResponse.json({ error: "inventory is required" }, { status: 400 });
+  }
+
+  const invText = Object.entries(inventory)
+    .map(([cat, items]) => `${cat.toUpperCase()}: ${items.map((i) => i.name).join(", ")}`)
+    .join("\n");
+
+  const modeLabels = (modes || []).join(", ") || "quick, comforting";
+
+  const allergies = (preferences?.allergies || []).join(", ");
+  const lifestyle = (preferences?.lifestyle || []).join(", ");
+  const religious = (preferences?.religious || []).join(", ");
+  const custom    = preferences?.custom || "";
+
+  let restrictionText = "";
+  if (allergies) restrictionText += `\nMEDICAL REQUIREMENTS (strict, no exceptions): ${allergies}`;
+  if (lifestyle) restrictionText += `\nDIETARY PREFERENCES: ${lifestyle}`;
+  if (religious) restrictionText += `\nRELIGIOUS REQUIREMENTS (strict, no exceptions): ${religious}`;
+  if (custom)    restrictionText += `\nADDITIONAL RESTRICTIONS: ${custom}`;
+
+  const prompt = `You are a warm, practical home-cooking assistant helping someone make dinner tonight.
+${restrictionText ? `\nDIETARY RESTRICTIONS — follow these exactly:${restrictionText}\n` : ""}
+HER INVENTORY:
+${invText}
+
+Tonight's priorities: ${modeLabels}.
+
+Suggest exactly 3 recipes using what she already has. Return ONLY a raw JSON array — no markdown, no backticks, no explanation:
+[{"name":"...","time":"...","difficulty":"...","comfort":"...","description":"...","uses":["..."],"needs":[],"steps":["Step 1","Step 2","Step 3"],"badges":["Gluten-free","Dairy-free"]},...]
+
+Rules:
+- Strictly follow ALL dietary restrictions above — this is non-negotiable
+- needs should be empty or have at most 1-2 simple items
+- Prioritize fridge items expiring soon
+- Instant mashed potatoes are a valid shortcut
+- Make each recipe feel different in mood and technique
+- Descriptions should be warm and specific — this is a reward after a long day
+- Include 4-6 clear actionable steps per recipe
+- badges should list which dietary requirements this recipe satisfies`;
+
+  try {
+    const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4-5",
+        max_tokens: 2048,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    const data = await anthropicRes.json();
+
+    if (!anthropicRes.ok || data.error) {
+      return NextResponse.json(
+        { error: data?.error?.message || `Anthropic API error: ${anthropicRes.status}` },
+        { status: 502 }
+      );
+    }
+
+    const raw = (data.content || [])
+      .map((b) => (b.type === "text" ? b.text : ""))
+      .join("")
+      .trim();
+
+    const cleaned = raw
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```\s*$/, "")
+      .trim();
+
+    let recipes;
+    try {
+      recipes = JSON.parse(cleaned);
+    } catch {
+      const match = cleaned.match(/\[[\s\S]*\]/);
+      if (match) {
+        recipes = JSON.parse(match[0]);
+      } else {
+        return NextResponse.json(
+          { error: `Could not parse response: ${raw.slice(0, 300)}` },
+          { status: 502 }
+        );
+      }
+    }
+
+    return NextResponse.json({ recipes: Array.isArray(recipes) ? recipes : [recipes] });
+  } catch (e) {
+    return NextResponse.json({ error: e.message || "Unknown error" }, { status: 500 });
+  }
+}
